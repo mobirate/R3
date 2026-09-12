@@ -22,6 +22,11 @@ public static class ObservableTracker
 
     const int MaxExaminedFrames = 48;
 
+    // Observers running a callback on this thread, innermost last. Lets code inside a handler find the
+    // subscription it belongs to, see TryGetCurrentSubscription. Only maintained while EnableTracking is on.
+    [ThreadStatic] static object?[]? currentObservers;
+    [ThreadStatic] static int currentDepth;
+
     static readonly WeakDictionary<TrackableDisposable, TrackingState> tracking = new();
 
     // for iterationg
@@ -67,8 +72,9 @@ public static class ObservableTracker
         }
 
         var id = Interlocked.Increment(ref trackingIdCounter);
-        trackableDisposable = new TrackableDisposable(subscription, id);
-        tracking.TryAdd(trackableDisposable, new TrackingState(id, typeName, DateTime.Now, stackTrace)); // use local now.
+        var state = new TrackingState(id, typeName, DateTime.Now, stackTrace); // use local now.
+        trackableDisposable = new TrackableDisposable(subscription, id) { State = state };
+        tracking.TryAdd(trackableDisposable, state);
 
         return true;
     }
@@ -80,6 +86,62 @@ public static class ObservableTracker
 
         dirty = true;
         tracking.TryRemove(subscription);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool EnterObserver(object observer)
+    {
+        if (!EnableTracking) return false;
+        EnterObserverCore(observer);
+        return true;
+    }
+
+    static void EnterObserverCore(object observer)
+    {
+        var stack = currentObservers;
+        if (stack == null)
+        {
+            currentObservers = stack = new object?[16];
+        }
+        else if (currentDepth == stack.Length)
+        {
+            Array.Resize(ref stack, stack.Length * 2);
+            currentObservers = stack;
+        }
+
+        stack[currentDepth++] = observer;
+    }
+
+    internal static void ExitObserver()
+    {
+        if (currentDepth > 0)
+        {
+            currentObservers![--currentDepth] = null;
+        }
+    }
+
+    /// <summary>
+    /// The tracked subscription whose observer is running a callback on this thread, innermost first.
+    /// False when tracking is off, no observer is running, or none of the running observers was
+    /// subscribed while tracking was on.
+    /// </summary>
+    public static bool TryGetCurrentSubscription(out TrackingState state)
+    {
+        var stack = currentObservers;
+        if (stack != null)
+        {
+            for (var i = currentDepth - 1; i >= 0; i--)
+            {
+                if (stack[i] is ISubscriptionOwner owner && owner.TrackedSubscription is TrackableDisposable trackable)
+                {
+                    state = trackable.State;
+                    return true;
+                }
+            }
+        }
+
+        state = default;
+        return false;
     }
 
     public static bool CheckAndResetDirty()
@@ -242,10 +304,17 @@ public static class ObservableTracker
     }
 }
 
+// Implemented by Observer<T> so the tracker can map a running observer back to its tracked subscription.
+internal interface ISubscriptionOwner
+{
+    IDisposable? TrackedSubscription { get; }
+}
+
 internal sealed class TrackableDisposable(IDisposable disposable, int trackingId) : IDisposable
 {
     public IDisposable Disposable => disposable;
     public int TrackingId => trackingId;
+    public TrackingState State { get; set; }
     int disposed;
 
     public void Dispose()

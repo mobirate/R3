@@ -31,12 +31,14 @@ public abstract class Observable<T>
     protected abstract IDisposable SubscribeCore(Observer<T> observer);
 }
 
-public abstract class Observer<T> : IDisposable
+public abstract class Observer<T> : IDisposable, ISubscriptionOwner
 {
 #if DEBUG
     [Obsolete("Only allow in Observable<T>.")]
 #endif
     internal SingleAssignmentDisposableCore SourceSubscription;
+
+    IDisposable? ISubscriptionOwner.TrackedSubscription => SourceSubscription.Disposable;
 
     int calledOnCompleted;
     int disposed;
@@ -52,6 +54,7 @@ public abstract class Observer<T> : IDisposable
     {
         if (IsDisposed || IsCalledCompleted) return;
 
+        var tracked = ObservableTracker.EnterObserver(this);
         try
         {
             OnNextCore(value);
@@ -59,6 +62,10 @@ public abstract class Observer<T> : IDisposable
         catch (Exception ex)
         {
             OnErrorResume(ex);
+        }
+        finally
+        {
+            if (tracked) ObservableTracker.ExitObserver();
         }
     }
 
@@ -69,6 +76,7 @@ public abstract class Observer<T> : IDisposable
     {
         if (IsDisposed || IsCalledCompleted) return;
 
+        var tracked = ObservableTracker.EnterObserver(this);
         try
         {
             OnErrorResumeCore(error);
@@ -76,6 +84,10 @@ public abstract class Observer<T> : IDisposable
         catch (Exception ex)
         {
             ObservableSystem.GetUnhandledExceptionHandler().Invoke(ex);
+        }
+        finally
+        {
+            if (tracked) ObservableTracker.ExitObserver();
         }
     }
 
@@ -91,6 +103,7 @@ public abstract class Observer<T> : IDisposable
         if (IsDisposed) return;
 
         var disposeOnFinally = AutoDisposeOnCompleted;
+        var tracked = ObservableTracker.EnterObserver(this);
         try
         {
             OnCompletedCore(result);
@@ -102,6 +115,7 @@ public abstract class Observer<T> : IDisposable
         }
         finally
         {
+            if (tracked) ObservableTracker.ExitObserver();
             if (disposeOnFinally)
             {
                 Dispose();
