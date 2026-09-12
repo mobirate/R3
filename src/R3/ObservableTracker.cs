@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
 
@@ -11,6 +12,15 @@ public static class ObservableTracker
 
     public static bool EnableTracking = false;
     public static bool EnableStackTrace = false;
+
+    /// <summary>
+    /// Frames kept per subscription when EnableStackTrace is on, counted from the first frame outside R3.
+    /// Every frame is one stack walk, so keep it small: the full trace made a project with 127k live
+    /// subscriptions spend minutes inside a single frame.
+    /// </summary>
+    public static int StackTraceFrames = 6;
+
+    const int MaxExaminedFrames = 48;
 
     static readonly WeakDictionary<TrackableDisposable, TrackingState> tracking = new();
 
@@ -40,8 +50,7 @@ public static class ObservableTracker
         string stackTrace = "";
         if (EnableStackTrace)
         {
-            var trace = new StackTrace(skipFrame, true);
-            stackTrace = trace.ToString();
+            stackTrace = CaptureStackTrace(skipFrame);
         }
 
         var unwrappedSubscription = UnwrapTrackableDisposable(subscription);
@@ -97,6 +106,90 @@ public static class ObservableTracker
             {
                 iterateCache.Clear();
             }
+        }
+    }
+
+    // Bounded replacement for new StackTrace(skip, true).ToString(). Mono builds a StackTrace one StackFrame
+    // at a time and each StackFrame is a full stack walk plus a pdb lookup, so the full trace costs
+    // O(depth^2) per subscription. This walks at most MaxExaminedFrames frames, drops the leading R3 frames
+    // and keeps StackTraceFrames of the caller's chain; when the walk never leaves R3 it keeps the R3 frames
+    // closest to the caller instead.
+    [DebuggerStepThrough]
+    static string CaptureStackTrace(int skipFrame)
+    {
+        var frames = StackTraceFrames;
+        if (frames <= 0) return "";
+
+        var sb = new StringBuilder();
+        var kept = 0;
+        List<(StackFrame frame, MethodBase method)>? leading = null;
+        for (var i = 0; i < MaxExaminedFrames && kept < frames; i++)
+        {
+            var frame = new StackFrame(skipFrame + 1 + i, true);
+            var method = frame.GetMethod();
+            if (method == null) break;
+
+            if (kept == 0 && IsLibraryFrame(method))
+            {
+                (leading ??= new()).Add((frame, method));
+                continue;
+            }
+
+            if (kept > 0) sb.Append('\n');
+            AppendFrame(sb, frame, method);
+            kept++;
+        }
+
+        if (kept == 0 && leading != null)
+        {
+            var start = Math.Max(0, leading.Count - frames);
+            for (var i = start; i < leading.Count; i++)
+            {
+                if (i > start) sb.Append('\n');
+                AppendFrame(sb, leading[i].frame, leading[i].method);
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    static bool IsLibraryFrame(MethodBase method)
+    {
+        var ns = method.DeclaringType?.Namespace;
+        return ns != null && (ns == "R3" || ns.StartsWith("R3.", StringComparison.Ordinal));
+    }
+
+    static void AppendFrame(StringBuilder sb, StackFrame frame, MethodBase method)
+    {
+        var type = method.DeclaringType;
+        var name = method.Name;
+
+        // async and iterator state machines: <Method>d__N.MoveNext -> Outer.Method
+        if (type != null && type.DeclaringType != null && type.Name.StartsWith("<", StringComparison.Ordinal))
+        {
+            var end = type.Name.IndexOf('>');
+            if (end > 1 && name == "MoveNext")
+            {
+                name = type.Name.Substring(1, end - 1);
+                type = type.DeclaringType;
+            }
+        }
+
+        if (type != null)
+        {
+            if (!string.IsNullOrEmpty(type.Namespace))
+            {
+                sb.Append(type.Namespace).Append('.');
+            }
+            TypeBeautify(type, sb);
+            sb.Append('.');
+        }
+        sb.Append(name);
+
+        var file = frame.GetFileName();
+        if (!string.IsNullOrEmpty(file))
+        {
+            sb.Append(" (at ").Append(file).Append(':').Append(frame.GetFileLineNumber()).Append(')');
         }
     }
 
