@@ -2,47 +2,60 @@
 
 namespace R3.Internal;
 
-// Add, Remove, Enumerate with sweep. All operations are thread safe(in spinlock).
+// Hash map with weakly referenced keys. An entry whose key has been collected is dropped the next
+// time its bucket is walked. Every public operation runs under the same lock, including CaptureSnapshot.
 internal class WeakDictionary<TKey, TValue>
     where TKey : class
 {
-    Entry[] buckets;
-    int size;
-    SpinLock gate; // mutable struct(not readonly)
-
+    readonly object gate = new object();
     readonly float loadFactor;
     readonly IEqualityComparer<TKey> keyEqualityComparer;
 
+    Entry[] buckets;
+    int size; // entries in the table, dead ones included until they are swept
+
     public WeakDictionary(int capacity = 4, float loadFactor = 0.75f, IEqualityComparer<TKey> keyComparer = null)
     {
-        var tableSize = CalculateCapacity(capacity, loadFactor);
-        this.buckets = new Entry[tableSize];
+        this.buckets = new Entry[CalculateCapacity(capacity, loadFactor)];
         this.loadFactor = loadFactor;
-        this.gate = new SpinLock(false);
         this.keyEqualityComparer = keyComparer ?? EqualityComparer<TKey>.Default;
     }
 
     public bool TryAdd(TKey key, TValue value)
     {
-        bool lockTaken = false;
-        try
+        var hash = keyEqualityComparer.GetHashCode(key);
+        lock (gate)
         {
-            gate.Enter(ref lockTaken);
-            return TryAddInternal(key, value);
-        }
-        finally
-        {
-            if (lockTaken) gate.Exit(false);
+            if (TryGetEntry(key, hash, out _, out _, out _))
+            {
+                return false; // duplicate
+            }
+
+            var capacity = CalculateCapacity(size + 1, loadFactor);
+            if (buckets.Length < capacity)
+            {
+                Rehash(capacity);
+            }
+
+            var index = hash & (buckets.Length - 1);
+            buckets[index] = new Entry
+            {
+                Key = new WeakReference<TKey>(key, false),
+                Value = value,
+                Hash = hash,
+                Next = buckets[index]
+            };
+            size++;
+            return true;
         }
     }
 
     public bool TryGetValue(TKey key, out TValue value)
     {
-        bool lockTaken = false;
-        try
+        var hash = keyEqualityComparer.GetHashCode(key);
+        lock (gate)
         {
-            gate.Enter(ref lockTaken);
-            if (TryGetEntry(key, out _, out var entry))
+            if (TryGetEntry(key, hash, out _, out _, out var entry))
             {
                 value = entry.Value;
                 return true;
@@ -51,173 +64,96 @@ internal class WeakDictionary<TKey, TValue>
             value = default(TValue);
             return false;
         }
-        finally
-        {
-            if (lockTaken) gate.Exit(false);
-        }
     }
 
     public bool TryRemove(TKey key)
     {
-        bool lockTaken = false;
-        try
+        var hash = keyEqualityComparer.GetHashCode(key);
+        lock (gate)
         {
-            gate.Enter(ref lockTaken);
-            if (TryGetEntry(key, out var hashIndex, out var entry))
+            if (TryGetEntry(key, hash, out var index, out var prev, out var entry))
             {
-                Remove(hashIndex, entry);
+                Unlink(index, prev, entry);
                 return true;
             }
 
             return false;
         }
-        finally
-        {
-            if (lockTaken) gate.Exit(false);
-        }
     }
 
-    bool TryAddInternal(TKey key, TValue value)
+    // Walks the bucket of the key and sweeps dead entries on the way.
+    // prev is the live entry before the match, or null when the match heads the bucket.
+    bool TryGetEntry(TKey key, int hash, out int index, out Entry prev, out Entry entry)
     {
-        var nextCapacity = CalculateCapacity(size + 1, loadFactor);
-
-    TRY_ADD_AGAIN:
-        if (buckets.Length < nextCapacity)
-        {
-            // rehash
-            var nextBucket = new Entry[nextCapacity];
-            for (int i = 0; i < buckets.Length; i++)
-            {
-                var e = buckets[i];
-                while (e != null)
-                {
-                    AddToBuckets(nextBucket, key, e.Value, e.Hash);
-                    e = e.Next;
-                }
-            }
-
-            buckets = nextBucket;
-            goto TRY_ADD_AGAIN;
-        }
-        else
-        {
-            // add entry
-            var successAdd = AddToBuckets(buckets, key, value, keyEqualityComparer.GetHashCode(key));
-            if (successAdd) size++;
-            return successAdd;
-        }
-    }
-
-    bool AddToBuckets(Entry[] targetBuckets, TKey newKey, TValue value, int keyHash)
-    {
-        var h = keyHash;
-        var hashIndex = h & (targetBuckets.Length - 1);
-
-    TRY_ADD_AGAIN:
-        if (targetBuckets[hashIndex] == null)
-        {
-            targetBuckets[hashIndex] = new Entry
-            {
-                Key = new WeakReference<TKey>(newKey, false),
-                Value = value,
-                Hash = h
-            };
-
-            return true;
-        }
-        else
-        {
-            // add to last.
-            var entry = targetBuckets[hashIndex];
-            while (entry != null)
-            {
-                if (entry.Key.TryGetTarget(out var target))
-                {
-                    if (keyEqualityComparer.Equals(newKey, target))
-                    {
-                        return false; // duplicate
-                    }
-                }
-                else
-                {
-                    Remove(hashIndex, entry);
-                    if (targetBuckets[hashIndex] == null) goto TRY_ADD_AGAIN; // add new entry
-                }
-
-                if (entry.Next != null)
-                {
-                    entry = entry.Next;
-                }
-                else
-                {
-                    // found last
-                    entry.Next = new Entry
-                    {
-                        Key = new WeakReference<TKey>(newKey, false),
-                        Value = value,
-                        Hash = h
-                    };
-                    entry.Next.Prev = entry;
-                }
-            }
-
-            return false;
-        }
-    }
-
-    bool TryGetEntry(TKey key, out int hashIndex, out Entry entry)
-    {
-        var table = buckets;
-        var hash = keyEqualityComparer.GetHashCode(key);
-        hashIndex = hash & table.Length - 1;
-        entry = table[hashIndex];
-
+        index = hash & (buckets.Length - 1);
+        prev = null;
+        entry = buckets[index];
         while (entry != null)
         {
             if (entry.Key.TryGetTarget(out var target))
             {
-                if (keyEqualityComparer.Equals(key, target))
+                if (entry.Hash == hash && keyEqualityComparer.Equals(key, target))
                 {
                     return true;
                 }
+
+                prev = entry;
+                entry = entry.Next;
             }
             else
             {
-                // sweap
-                Remove(hashIndex, entry);
+                var next = entry.Next;
+                Unlink(index, prev, entry);
+                entry = next;
             }
-
-            entry = entry.Next;
         }
 
         return false;
     }
 
-    void Remove(int hashIndex, Entry entry)
+    void Unlink(int index, Entry prev, Entry entry)
     {
-        if (entry.Prev == null && entry.Next == null)
+        if (prev == null)
         {
-            buckets[hashIndex] = null;
+            buckets[index] = entry.Next;
         }
         else
         {
-            if (entry.Prev == null)
-            {
-                buckets[hashIndex] = entry.Next;
-            }
-            if (entry.Prev != null)
-            {
-                entry.Prev.Next = entry.Next;
-            }
-            if (entry.Next != null)
-            {
-                entry.Next.Prev = entry.Prev;
-            }
+            prev.Next = entry.Next;
         }
+
+        entry.Next = null;
         size--;
     }
 
-    // avoid allocate everytime.
+    // Moves the live entries into a table of the given capacity; dead entries are dropped.
+    void Rehash(int capacity)
+    {
+        var next = new Entry[capacity];
+        var count = 0;
+        for (int i = 0; i < buckets.Length; i++)
+        {
+            var entry = buckets[i];
+            while (entry != null)
+            {
+                var following = entry.Next;
+                if (entry.Key.TryGetTarget(out _))
+                {
+                    var index = entry.Hash & (capacity - 1);
+                    entry.Next = next[index];
+                    next[index] = entry;
+                    count++;
+                }
+
+                entry = following;
+            }
+        }
+
+        buckets = next;
+        size = count;
+    }
+
+    // Fills the list from its start, reusing existing slots, and returns the number of live entries.
     public int CaptureSnapshot(ref List<TValue> list, bool clear = true)
     {
         if (clear)
@@ -226,41 +162,38 @@ internal class WeakDictionary<TKey, TValue>
         }
 
         var listIndex = 0;
-
-        bool lockTaken = false;
-        try
+        lock (gate)
         {
             for (int i = 0; i < buckets.Length; i++)
             {
+                Entry prev = null;
                 var entry = buckets[i];
                 while (entry != null)
                 {
-                    if (entry.Key.TryGetTarget(out var target))
+                    var next = entry.Next;
+                    if (entry.Key.TryGetTarget(out _))
                     {
                         var item = entry.Value;
                         if (listIndex < list.Count)
                         {
-                            list[listIndex++] = item;
+                            list[listIndex] = item;
                         }
                         else
                         {
                             list.Add(item);
-                            listIndex++;
                         }
+
+                        listIndex++;
+                        prev = entry;
                     }
                     else
                     {
-                        // sweap
-                        Remove(i, entry);
+                        Unlink(i, prev, entry);
                     }
 
-                    entry = entry.Next;
+                    entry = next;
                 }
             }
-        }
-        finally
-        {
-            if (lockTaken) gate.Exit(false);
         }
 
         return listIndex;
@@ -290,32 +223,6 @@ internal class WeakDictionary<TKey, TValue>
         public WeakReference<TKey> Key;
         public TValue Value;
         public int Hash;
-        public Entry Prev;
         public Entry Next;
-
-        // debug only
-        public override string ToString()
-        {
-            if (Key.TryGetTarget(out var target))
-            {
-                return target + "(" + Count() + ")";
-            }
-            else
-            {
-                return "(Dead)";
-            }
-        }
-
-        int Count()
-        {
-            var count = 1;
-            var n = this;
-            while (n.Next != null)
-            {
-                count++;
-                n = n.Next;
-            }
-            return count;
-        }
     }
 }
